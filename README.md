@@ -41,6 +41,46 @@ metacharacters stay data.
 `,remotefetch.status` is the command to reach for when something is wrong — it
 separates a sleeping laptop from a wrong token or a wrong address.
 
+## When the laptop is asleep
+
+Every successful fetch is stored in `cache.json` next to the module's config.
+When the machine cannot answer, the module replies with the last snapshot it
+has instead of refusing:
+
+```text
+🕒 xpert не на связи — показан последний снимок, 2ч 14мин назад.
+
+OS: NixOS 25.11
+Kernel: Linux 6.12.8
+…
+
+🔌 xpert недоступен (http://100.120.95.96:8471). Проверь, что он не спит, в сети и lavis-fetchd запущен.
+```
+
+The age leads the message and the live failure stays at the bottom, so the
+reply never passes old output off as a fresh reading and still says why the
+machine is quiet.
+
+A snapshot is served only when the machine itself could not answer: it was
+unreachable, it timed out, the agent was busy with another run, or fastfetch
+failed on it. A rejected token, a malformed address and a missing fastfetch
+are configuration errors — those are reported as errors, because answering
+them with old output would leave you hunting a problem the module had already
+named.
+
+Snapshots are kept per argument set, four of them, newest first. If nothing
+was ever fetched with the arguments you just used, the newest snapshot is sent
+with a line saying which arguments produced it:
+
+```text
+🕒 xpert не на связи — показан последний снимок, 2ч 14мин назад.
+⚠️ Снимок сделан с другими аргументами: --logo NixOS
+```
+
+`,remotefetch.status` names the age of the newest snapshot when the agent does
+not answer, so you can tell a laptop that slept for ten minutes from one that
+has not been seen in a week.
+
 ## Argument policy
 
 Every fastfetch option is passed through except the ones that read or write a
@@ -139,8 +179,13 @@ install -m 600 /dev/null /var/lib/lavis/.local/state/lavis/modules/remotefetch/c
 | `token_file` | read the token from this path instead of inlining it |
 | `label` | name used in replies; defaults to the hostname the agent reports |
 
+The module writes `cache.json` into that same state directory, mode `600`, one
+snapshot per argument set and four at most. Deleting it costs nothing but the
+offline fallback, until the next successful fetch refills it.
+
 When run outside Lavis the module also accepts
-`~/.config/lavis/remotefetch.json`.
+`~/.config/lavis/remotefetch.json` for its config and keeps snapshots in
+`~/.cache/lavis/remotefetch.json`.
 
 ## Build, test and install
 
@@ -182,10 +227,10 @@ services.lavis.extensions = [
 
 ## Capabilities
 
-`network` to reach the agent, and `persistent_state_read` to read
-`config.json`. The module holds no Telegram capabilities: it sends no
-messages, reads none, and makes no Telegram RPC — it answers a command with
-text and nothing else.
+`network` to reach the agent, `persistent_state_read` to read `config.json`,
+and `persistent_state_write` to keep the last fetch in `cache.json`. The module
+holds no Telegram capabilities: it sends no messages, reads none, and makes no
+Telegram RPC — it answers a command with text and nothing else.
 
 ## Fidelity
 
@@ -204,4 +249,6 @@ names the agent too. Exclude them when it matters:
 The Module API v6 lifecycle deadline is five seconds. The budget nests inside
 it: the command gets 4s, the HTTP request 3.5s, and the agent's fastfetch run
 2.5s. A laptop that is asleep or off the network fails on connect and answers
-in milliseconds rather than burning the deadline.
+in milliseconds rather than burning the deadline. The snapshot it falls back
+on is read from local disk, so the offline reply is the fastest one the module
+sends.

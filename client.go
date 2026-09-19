@@ -41,19 +41,28 @@ type agentError struct {
 	Error string `json:"error"`
 }
 
+// callFailure is a request that produced no result. offline marks the failures
+// a stored snapshot can stand in for: the machine is asleep, off the network,
+// or momentarily unable to run fastfetch. A rejected token, a bad address or a
+// missing fastfetch is not one — answering those with old output would leave
+// the operator hunting a problem the module had already named.
+type callFailure struct {
+	message string
+	offline bool
+}
+
 var client = &http.Client{Timeout: httpTimeout}
 
-// call performs one agent request and decodes its result. It returns an empty
-// string on success, or a ready-to-send user-facing message describing the
-// failure.
-func call(ctx context.Context, cfg *config, method, path string, body []byte, out any) string {
+// call performs one agent request and decodes its result. It returns nil on
+// success, or a failure carrying a ready-to-send user-facing message.
+func call(ctx context.Context, cfg *config, method, path string, body []byte, out any) *callFailure {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, cfg.URL+path, reader)
 	if err != nil {
-		return "⚠️ Некорректный адрес агента: " + cfg.URL
+		return &callFailure{message: "⚠️ Некорректный адрес агента: " + cfg.URL}
 	}
 	request.Header.Set("Authorization", "Bearer "+cfg.Token)
 	request.Header.Set("Accept", "application/json")
@@ -64,48 +73,57 @@ func call(ctx context.Context, cfg *config, method, path string, body []byte, ou
 	response, err := client.Do(request)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-			return fmt.Sprintf("⏱ %s не ответил за %s.", cfg.displayName(""), httpTimeout)
+			return &callFailure{
+				message: fmt.Sprintf("⏱ %s не ответил за %s.", cfg.displayName(""), httpTimeout),
+				offline: true,
+			}
 		}
-		return fmt.Sprintf(
-			"🔌 %s недоступен (%s). Проверь, что он не спит, в сети и lavis-fetchd запущен.",
-			cfg.displayName(""), cfg.URL,
-		)
+		return &callFailure{
+			message: fmt.Sprintf(
+				"🔌 %s недоступен (%s). Проверь, что он не спит, в сети и lavis-fetchd запущен.",
+				cfg.displayName(""), cfg.URL,
+			),
+			offline: true,
+		}
 	}
 	defer response.Body.Close()
 
 	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
 	if err != nil {
-		return "⚠️ Оборвался ответ агента."
+		return &callFailure{message: "⚠️ Оборвался ответ агента.", offline: true}
 	}
 	if response.StatusCode != http.StatusOK {
 		return agentFailure(response.StatusCode, payload)
 	}
 	if err := json.Unmarshal(payload, out); err != nil {
-		return "⚠️ Непонятный ответ агента."
+		return &callFailure{message: "⚠️ Непонятный ответ агента."}
 	}
-	return ""
+	return nil
 }
 
-func agentFailure(status int, payload []byte) string {
-	var failure agentError
+func agentFailure(status int, payload []byte) *callFailure {
+	var body agentError
 	detail := ""
-	if err := json.Unmarshal(payload, &failure); err == nil {
-		detail = failure.Error
+	if err := json.Unmarshal(payload, &body); err == nil {
+		detail = body.Error
 	}
 	switch status {
 	case http.StatusUnauthorized:
-		return "🔒 Агент отклонил токен. Сверь token в конфиге модуля и --token-file агента."
+		return &callFailure{message: "🔒 Агент отклонил токен. Сверь token в конфиге модуля и --token-file агента."}
 	case http.StatusTooManyRequests:
-		return "⏳ Агент занят другим запросом, повтори."
+		return &callFailure{message: "⏳ Агент занят другим запросом, повтори.", offline: true}
 	case http.StatusGatewayTimeout:
-		return "⏱ Fastfetch на удалённой машине не уложился в таймаут агента."
+		return &callFailure{message: "⏱ Fastfetch на удалённой машине не уложился в таймаут агента.", offline: true}
 	case http.StatusServiceUnavailable:
-		return "⚠️ На удалённой машине нет fastfetch."
+		return &callFailure{message: "⚠️ На удалённой машине нет fastfetch."}
 	}
+	// A gateway error means fastfetch itself failed on the other machine just
+	// now, which the next attempt may well survive.
+	offline := status == http.StatusBadGateway
 	if detail == "" {
-		return fmt.Sprintf("⚠️ Агент вернул HTTP %d.", status)
+		return &callFailure{message: fmt.Sprintf("⚠️ Агент вернул HTTP %d.", status), offline: offline}
 	}
-	return "⚠️ " + clip(detail)
+	return &callFailure{message: "⚠️ " + clip(detail), offline: offline}
 }
 
 func isTimeout(err error) bool {

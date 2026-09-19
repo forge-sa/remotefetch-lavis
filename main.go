@@ -24,6 +24,12 @@ const (
 	// text into a 4096 UTF-16 unit message with provenance appended, so the
 	// reply is clipped well below both.
 	maxReplyUnits = 3800
+	// minOutputUnits keeps a footer from crowding the fetch out entirely; a
+	// reply with no fastfetch output in it is not worth sending.
+	minOutputUnits = 200
+	// maxArgsPreviewUnits bounds the echo of a snapshot's arguments: up to 64
+	// of them can be 256 bytes each, and the output is what the reader came for.
+	maxArgsPreviewUnits = 120
 )
 
 type request struct {
@@ -135,26 +141,78 @@ func fetch(ctx context.Context, cfg *config, arguments string) string {
 	}
 
 	var result fetchResponse
-	if failure := call(ctx, cfg, "POST", "/v1/fastfetch", body, &result); failure != "" {
-		return failure
+	if failure := call(ctx, cfg, "POST", "/v1/fastfetch", body, &result); failure != nil {
+		// A machine that is asleep or off the tailnet is the normal case for a
+		// laptop, and the last snapshot answers the question better than a
+		// refusal does.
+		if failure.offline {
+			if stale := staleReply(cfg, args, failure.message); stale != "" {
+				return stale
+			}
+		}
+		return failure.message
 	}
 	output := strings.TrimRight(result.Output, "\n")
 	if output == "" {
 		return "⚠️ Fastfetch не вернул вывод."
 	}
+	remember(args, result, output)
 
 	footer := fmt.Sprintf("📍 %s · %d мс", cfg.displayName(result.Host), result.TookMS)
 	if result.Truncated {
 		footer += " · вывод обрезан агентом"
 	}
-	return clip(output) + "\n\n" + footer
+	return withFooter(output, footer)
+}
+
+// staleReply renders the newest stored snapshot when the machine cannot answer
+// now. The banner leads so the age is read before the numbers, and the live
+// failure stays as the footer so the reply still says why the machine is quiet.
+// It returns an empty string when nothing has ever been fetched.
+func staleReply(cfg *config, args []string, reason string) string {
+	entry, sameArgs, found := loadCache().lookup(args)
+	if !found || entry.Output == "" {
+		return ""
+	}
+	header := fmt.Sprintf(
+		"🕒 %s не на связи — показан последний снимок, %s назад.",
+		cfg.displayName(entry.Host), humanizeDuration(snapshotAge(entry)),
+	)
+	if !sameArgs {
+		header += "\n⚠️ Снимок сделан с другими аргументами: " + clipTo(describeArgs(entry.Args), maxArgsPreviewUnits)
+	}
+	prefix := header + "\n\n"
+	return prefix + withinBudget(entry.Output, reason, maxReplyUnits-utf16Len(prefix))
+}
+
+// snapshotAge is never negative: a clock that moved backwards between the
+// fetch and the reply would otherwise print an age from the future.
+func snapshotAge(entry cacheEntry) time.Duration {
+	age := time.Since(time.Unix(entry.FetchedAt, 0))
+	if age < 0 {
+		return 0
+	}
+	return age
+}
+
+func describeArgs(args []string) string {
+	if len(args) == 0 {
+		return "без аргументов"
+	}
+	return strings.Join(args, " ")
 }
 
 func status(ctx context.Context, cfg *config) string {
 	var result healthResponse
 	started := time.Now()
-	if failure := call(ctx, cfg, "GET", "/v1/health", nil, &result); failure != "" {
-		return failure
+	if failure := call(ctx, cfg, "GET", "/v1/health", nil, &result); failure != nil {
+		if entry, ok := loadCache().newest(); failure.offline && ok {
+			return fmt.Sprintf(
+				"%s\n\nЕсть снимок %s назад — ,remotefetch покажет его, пока машина не ответит.",
+				failure.message, humanizeDuration(snapshotAge(entry)),
+			)
+		}
+		return failure.message
 	}
 	return fmt.Sprintf(
 		"🟢 %s на связи\n\nАдрес: %s\nFastfetch: %s\nАгент работает: %s\nОтвет за: %d мс",
@@ -179,14 +237,36 @@ func humanizeDuration(d time.Duration) string {
 	}
 }
 
+// withFooter joins fastfetch output to its footer inside the host's rendering
+// budget.
+func withFooter(output, footer string) string {
+	return withinBudget(output, footer, maxReplyUnits)
+}
+
+// withinBudget reserves the footer first: it carries the machine name, the age
+// of a snapshot or the reason the machine is quiet, so it is the part that has
+// to survive when the output is long.
+func withinBudget(output, footer string, budget int) string {
+	const separator = "\n\n"
+	room := budget - utf16Len(footer) - utf16Len(separator)
+	if room < minOutputUnits {
+		return clipTo(footer, budget)
+	}
+	return clipTo(output, room) + separator + footer
+}
+
 // clip trims the reply to the host's rendering budget, counted in UTF-16
 // units because that is what Telegram and the Lavis response layer measure.
 func clip(text string) string {
-	if utf16Len(text) <= maxReplyUnits {
+	return clipTo(text, maxReplyUnits)
+}
+
+func clipTo(text string, budget int) string {
+	if utf16Len(text) <= budget {
 		return text
 	}
 	const suffix = "\n… вывод обрезан"
-	budget := maxReplyUnits - utf16Len(suffix)
+	budget -= utf16Len(suffix)
 	var out strings.Builder
 	used := 0
 	for _, r := range text {
